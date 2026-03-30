@@ -23,6 +23,10 @@ A股交易日历模块
 
 from datetime import date, datetime, timedelta
 from typing import List, Optional, Union
+import json
+import os
+import urllib.request
+import urllib.error
 
 # 支持传入 date / datetime / str / tuple
 DateLike = Union[date, datetime, str, tuple]
@@ -41,14 +45,24 @@ __all__ = [
 ]
 
 # ══════════════════════════════════════════════════════
-# 节假日数据（休市日期，不含周末本身）
-# 只需列出因法定节假日而休市的 工作日 日期
-# 以及 周末中被安排为调休上班的日期（这些日虽为周末但是交易日）
+# 自动更新配置
+# ══════════════════════════════════════════════════════
+
+_REMOTE_URL = (
+    'https://raw.githubusercontent.com/yuchenaaa/'
+    'a-share-trading-calendar/main/holiday_data.json'
+)
+_CACHE_DIR = os.path.join(os.path.expanduser('~'), '.trading_calendar')
+_CACHE_FILE = os.path.join(_CACHE_DIR, 'holiday_data.json')
+_CHECK_INTERVAL_DAYS = 7  # 每7天检查一次远程更新
+
+# ══════════════════════════════════════════════════════
+# 内置节假日数据（作为兜底，无网络时使用）
 # ══════════════════════════════════════════════════════
 
 # 法定节假日休市日期（只列非周末的部分，周末本身已默认休市）
 # 格式：年份 -> [月日元组列表]
-HOLIDAYS = {
+_BUILTIN_HOLIDAYS = {
     2025: [
         # 元旦 1月1日(周三)
         (1, 1),
@@ -83,7 +97,7 @@ HOLIDAYS = {
 }
 
 # 调休补班日（周末但需要上班/交易的日期）
-MAKEUP_WORKDAYS = {
+_BUILTIN_MAKEUP_WORKDAYS = {
     2025: [
         (1, 26),   # 周日，春节调休
         (2, 8),    # 周六，春节调休
@@ -97,6 +111,96 @@ MAKEUP_WORKDAYS = {
         (10, 10),  # 周六，国庆调休
     ],
 }
+
+
+# ══════════════════════════════════════════════════════
+# 自动更新机制
+# 从 GitHub 拉取最新节假日数据，本地缓存，7天检查一次
+# 无网络时自动回退到内置数据，不影响使用
+# ══════════════════════════════════════════════════════
+
+def _load_remote_data():
+    """从 GitHub 下载最新的节假日数据并缓存到本地。"""
+    try:
+        req = urllib.request.Request(_REMOTE_URL, headers={'User-Agent': 'trading-calendar'})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            raw = json.loads(resp.read().decode('utf-8'))
+
+        # 写入本地缓存
+        os.makedirs(_CACHE_DIR, exist_ok=True)
+        cache = {
+            'updated': date.today().isoformat(),
+            'data': raw,
+        }
+        with open(_CACHE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(cache, f, ensure_ascii=False)
+        return raw
+    except Exception:
+        return None
+
+
+def _load_cached_data():
+    """读取本地缓存的节假日数据。返回 (data_dict, needs_refresh)。"""
+    if not os.path.exists(_CACHE_FILE):
+        return None, True
+    try:
+        with open(_CACHE_FILE, 'r', encoding='utf-8') as f:
+            cache = json.load(f)
+        last_update = date.fromisoformat(cache['updated'])
+        age_days = (date.today() - last_update).days
+        return cache['data'], age_days >= _CHECK_INTERVAL_DAYS
+    except Exception:
+        return None, True
+
+
+def _parse_data(raw):
+    """将 JSON 数据转为 HOLIDAYS / MAKEUP_WORKDAYS 字典格式。"""
+    holidays = {}
+    makeup = {}
+    for year_str, info in raw.items():
+        year = int(year_str)
+        holidays[year] = [tuple(x) for x in info.get('holidays', [])]
+        makeup[year] = [tuple(x) for x in info.get('makeup_workdays', [])]
+    return holidays, makeup
+
+
+def _init_data():
+    """初始化节假日数据：优先用缓存/远程，兜底用内置。"""
+    global HOLIDAYS, MAKEUP_WORKDAYS
+
+    # 先用内置数据
+    HOLIDAYS = dict(_BUILTIN_HOLIDAYS)
+    MAKEUP_WORKDAYS = dict(_BUILTIN_MAKEUP_WORKDAYS)
+
+    # 尝试加载缓存
+    cached, needs_refresh = _load_cached_data()
+
+    if cached:
+        remote_h, remote_m = _parse_data(cached)
+        HOLIDAYS.update(remote_h)
+        MAKEUP_WORKDAYS.update(remote_m)
+
+    # 需要刷新时，后台尝试拉取（不阻塞主流程）
+    if needs_refresh:
+        try:
+            import threading
+            def _bg_refresh():
+                global HOLIDAYS, MAKEUP_WORKDAYS
+                raw = _load_remote_data()
+                if raw:
+                    remote_h, remote_m = _parse_data(raw)
+                    HOLIDAYS.update(remote_h)
+                    MAKEUP_WORKDAYS.update(remote_m)
+            t = threading.Thread(target=_bg_refresh, daemon=True)
+            t.start()
+        except Exception:
+            pass
+
+
+# 模块加载时初始化
+HOLIDAYS = {}
+MAKEUP_WORKDAYS = {}
+_init_data()
 
 
 def _normalize(d: DateLike) -> date:
